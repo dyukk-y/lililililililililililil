@@ -16,7 +16,8 @@ from dotenv import load_dotenv
 
 from steam_manager import SteamManager
 
-# Загрузка переменных окружения из .env файла
+# Загрузка переменных окружения из .env файла (только для локальной разработки)
+# На Bothost эта строка просто не найдет файл и не вызовет ошибку
 load_dotenv()
 
 # Настройка логирования
@@ -26,39 +27,66 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Конфигурация
+# ============================================
+# ПОЛУЧЕНИЕ ТОКЕНА ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
+# ============================================
+# На Bothost токен будет передан через переменные окружения,
+# которые вы настроили в панели управления
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не найден в .env файле!")
 
-# Загрузка конфигурации из INI файла
+if not BOT_TOKEN:
+    # Если токена нет, логируем критическую ошибку и останавливаем бота
+    logger.critical("=" * 60)
+    logger.critical("КРИТИЧЕСКАЯ ОШИБКА: BOT_TOKEN не найден в переменных окружения!")
+    logger.critical("Убедитесь, что вы добавили переменную BOT_TOKEN в панели управления Bothost.")
+    logger.critical("=" * 60)
+    # Выходим с ошибкой, чтобы бот не запустился без токена
+    exit(1)
+
+logger.info(f"✅ BOT_TOKEN успешно загружен из переменных окружения")
+
+# ============================================
+# ЗАГРУЗКА КОНФИГУРАЦИИ ИЗ INI ФАЙЛА
+# ============================================
 config = configparser.ConfigParser()
 config_path = Path(__file__).parent / "config.ini"
 
+# Проверяем наличие config.ini и создаем из примера если его нет
 if not config_path.exists():
-    raise FileNotFoundError(
-        f"Файл {config_path} не найден! Создайте его на основе примера.\n"
-        "Пример:\n"
-        "[telegram]\n"
-        "allowed_user_id = 123456789\n\n"
-        "[account1]\n"
-        "username = steam_login\n"
-        "password = steam_password\n"
-        "games = 570,730,440"
-    )
+    example_path = Path(__file__).parent / "config.ini.example"
+    if example_path.exists():
+        import shutil
+        shutil.copy(example_path, config_path)
+        logger.info(f"✅ Создан файл {config_path} из примера. Пожалуйста, заполните его данными.")
+        logger.info("⚠️ Бот остановлен до заполнения config.ini")
+        exit(1)
+    else:
+        logger.critical(f"❌ Файл {config_path} не найден и нет примера config.ini.example!")
+        logger.critical("Создайте файл config.ini вручную или добавьте config.ini.example в репозиторий.")
+        exit(1)
 
-config.read(config_path, encoding='utf-8')
+# Читаем конфигурацию
+try:
+    config.read(config_path, encoding='utf-8')
+    logger.info(f"✅ Файл {config_path} успешно загружен")
+except Exception as e:
+    logger.critical(f"❌ Ошибка чтения {config_path}: {e}")
+    exit(1)
 
 # Получение разрешенного ID пользователя
 try:
     ALLOWED_USER_ID = int(config.get('telegram', 'allowed_user_id', fallback='0'))
     if ALLOWED_USER_ID == 0:
-        logger.warning("allowed_user_id не установлен в config.ini!")
+        logger.warning("⚠️ allowed_user_id не установлен в config.ini! Бот будет доступен всем!")
+    else:
+        logger.info(f"✅ Разрешенный пользователь: {ALLOWED_USER_ID}")
 except ValueError:
     ALLOWED_USER_ID = 0
-    logger.warning("allowed_user_id должен быть числом!")
+    logger.warning("⚠️ allowed_user_id должен быть числом! Бот будет доступен всем!")
 
-# Инициализация бота и диспетчера
+# ============================================
+# ИНИЦИАЛИЗАЦИЯ БОТА
+# ============================================
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -84,16 +112,20 @@ for i in range(1, 4):
                 games=games_list
             )
             loaded_accounts += 1
-            logger.info(f"Загружен аккаунт {section}: {username}")
+            logger.info(f"✅ Загружен аккаунт {section}: {username}")
 
-logger.info(f"Загружено {loaded_accounts} аккаунтов")
+logger.info(f"✅ Всего загружено аккаунтов: {loaded_accounts}")
 
-# Состояния FSM
+# ============================================
+# СОСТОЯНИЯ FSM
+# ============================================
 class AccountStates(StatesGroup):
     selecting_account = State()
     waiting_for_2fa = State()
 
-# Middleware для проверки доступа
+# ============================================
+# MIDDLEWARE ДЛЯ ПРОВЕРКИ ДОСТУПА
+# ============================================
 @dp.update.middleware()
 async def access_middleware(handler, event, data):
     """Проверка, что пользователь имеет доступ к боту"""
@@ -104,7 +136,9 @@ async def access_middleware(handler, event, data):
     elif isinstance(event, types.CallbackQuery):
         user_id = event.from_user.id
     
-    if user_id and user_id == ALLOWED_USER_ID:
+    if ALLOWED_USER_ID == 0:  # Если ID не указан, доступ открыт всем
+        return await handler(event, data)
+    elif user_id and user_id == ALLOWED_USER_ID:
         return await handler(event, data)
     elif user_id:
         await event.answer("⛔ У вас нет доступа к этому боту!")
@@ -112,7 +146,9 @@ async def access_middleware(handler, event, data):
     else:
         return await handler(event, data)
 
-# Клавиатуры
+# ============================================
+# КЛАВИАТУРЫ
+# ============================================
 def get_main_keyboard() -> InlineKeyboardMarkup:
     """Главная клавиатура"""
     buttons = [
@@ -126,12 +162,9 @@ def get_accounts_keyboard() -> InlineKeyboardMarkup:
     """Клавиатура выбора аккаунта"""
     buttons = []
     for name, account in steam_manager.accounts.items():
-        stats = asyncio.create_task(account.get_stats())
-        # В реальном коде нужно получать статус синхронно или кэшировать
-        status_emoji = "🔴"  # По умолчанию
         buttons.append([
             InlineKeyboardButton(
-                text=f"{status_emoji} Аккаунт {name[-1]} ({account.username})",
+                text=f"👤 Аккаунт {name[-1]} ({account.username})",
                 callback_data=f"account_{name}"
             )
         ])
@@ -170,7 +203,9 @@ def get_account_control_keyboard(account_name: str, stats: Dict) -> InlineKeyboa
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# Обработчики команд
+# ============================================
+# ОБРАБОТЧИКИ КОМАНД
+# ============================================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     """Обработчик команды /start"""
@@ -204,7 +239,9 @@ async def cmd_help(message: types.Message):
     )
     await message.answer(help_text, parse_mode="Markdown")
 
-# Обработчики callback-запросов
+# ============================================
+# ОБРАБОТЧИКИ CALLBACK-ЗАПРОСОВ
+# ============================================
 @dp.callback_query(F.data == "select_account")
 async def select_account(callback: CallbackQuery):
     """Выбор аккаунта"""
@@ -485,19 +522,26 @@ async def account_stats(callback: CallbackQuery):
         )
     await callback.answer()
 
-# Запуск бота
+# ============================================
+# ЗАПУСК БОТА
+# ============================================
 async def main():
-    logger.info("=" * 50)
-    logger.info("Запуск Steam Hour Booster Bot...")
-    logger.info(f"Загружено аккаунтов: {len(steam_manager.accounts)}")
-    logger.info(f"Разрешенный пользователь: {ALLOWED_USER_ID}")
-    logger.info("=" * 50)
+    logger.info("=" * 60)
+    logger.info("🚀 Запуск Steam Hour Booster Bot...")
+    logger.info(f"✅ Загружено аккаунтов: {len(steam_manager.accounts)}")
+    
+    if ALLOWED_USER_ID == 0:
+        logger.info("⚠️ Режим доступа: открыт для всех пользователей")
+    else:
+        logger.info(f"🔐 Режим доступа: только для пользователя {ALLOWED_USER_ID}")
+    
+    logger.info("=" * 60)
     
     try:
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
-        logger.info("Бот остановлен")
+        logger.info("👋 Бот остановлен")
 
 if __name__ == "__main__":
     asyncio.run(main())
