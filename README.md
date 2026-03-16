@@ -22,5 +22,5 @@ Telegram бот для накрутки часов в играх Steam с под
 
 ### 1. Клонирование репозитория
 ```bash
-git clone <ваш-репозиторий>
+git clone lililililililililililil
 cd steam-hour-booster
