@@ -1,0 +1,29 @@
+# Виртуальное окружение
+.venv/
+venv/
+ENV/
+
+# Файлы конфигурации
+.env
+config.ini
+*.ini
+
+# Сессии Steam
+sessions/
+*.session
+
+# Кэш Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Логи
+*.log
