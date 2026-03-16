@@ -2,11 +2,13 @@ import asyncio
 import logging
 import pickle
 import os
+import json
 from pathlib import Path
 from typing import Dict, List, Optional, Callable, Any
 from steam.client import SteamClient
-from steam.guard import SteamAuthenticator, SteamGuardAccount
+from steam.guard import SteamAuthenticator
 from steam.enums import EResult
+from steam.enums.emsg import EMsg
 
 class SteamAccount:
     """Класс для управления одним Steam аккаунтом с поддержкой Steam Guard"""
@@ -24,6 +26,7 @@ class SteamAccount:
         self.awaiting_2fa = False
         self.login_future = None
         self.steam_id = None
+        self.login_key = None
         
         # Настройка callback'ов для SteamClient
         self.client.on('connected', self._on_connected)
@@ -54,6 +57,7 @@ class SteamAccount:
             
     def _on_login_key(self, login_key):
         """Callback при получении login key"""
+        self.login_key = login_key
         logging.info(f"[{self.name}] Получен login key")
         self._save_session()
         
@@ -68,6 +72,9 @@ class SteamAccount:
         elif result == EResult.TwoFactorCodeMismatch:
             if self.login_future and not self.login_future.done():
                 self.login_future.set_exception(Exception("Неверный код Steam Guard"))
+        elif result == EResult.InvalidLoginAuthCode:
+            if self.login_future and not self.login_future.done():
+                self.login_future.set_exception(Exception("Неверный код авторизации"))
                 
     def _on_disconnected(self):
         """Callback при отключении"""
@@ -84,12 +91,13 @@ class SteamAccount:
         """Сохранить сессию в файл"""
         try:
             session_path = self._get_session_path()
+            session_data = {
+                'username': self.username,
+                'steam_id': self.steam_id,
+                'login_key': self.login_key
+            }
             with open(session_path, 'wb') as f:
-                pickle.dump({
-                    'username': self.username,
-                    'steam_id': self.steam_id,
-                    'login_key': self.client.login_key if hasattr(self.client, 'login_key') else None
-                }, f)
+                pickle.dump(session_data, f)
             logging.info(f"[{self.name}] Сессия сохранена")
         except Exception as e:
             logging.error(f"[{self.name}] Ошибка сохранения сессии: {e}")
@@ -101,6 +109,8 @@ class SteamAccount:
             if session_path.exists():
                 with open(session_path, 'rb') as f:
                     session = pickle.load(f)
+                self.login_key = session.get('login_key')
+                self.steam_id = session.get('steam_id')
                 logging.info(f"[{self.name}] Сессия загружена")
                 return True
         except Exception as e:
@@ -121,19 +131,24 @@ class SteamAccount:
         
         try:
             # Пытаемся войти
+            login_params = {
+                'username': self.username,
+                'password': self.password,
+            }
+            
+            # Добавляем login_key если есть
+            if self.login_key:
+                login_params['login_key'] = self.login_key
+                
+            # Добавляем 2FA код если предоставлен
             if two_factor_code:
-                # Вход с 2FA кодом
-                self.client.login(
-                    username=self.username,
-                    password=self.password,
-                    two_factor_code=two_factor_code
-                )
-            else:
-                # Пробуем войти с сохраненным login key если есть
-                self.client.login(
-                    username=self.username,
-                    password=self.password
-                )
+                login_params['two_factor_code'] = two_factor_code
+            
+            # Выполняем вход в отдельном потоке, так как SteamClient синхронный
+            await asyncio.get_event_loop().run_in_executor(
+                None, 
+                lambda: self.client.login(**login_params)
+            )
             
             # Ждем результата с таймаутом
             try:
@@ -141,7 +156,7 @@ class SteamAccount:
                 return {"success": True, "message": "Вход выполнен"}
             except asyncio.TimeoutError:
                 # Проверяем, требуется ли 2FA
-                if self.client.relogin_available and self.client.awaiting_2fa:
+                if hasattr(self.client, 'relogin_available') and self.client.relogin_available:
                     self.awaiting_2fa = True
                     return {
                         "success": False,
@@ -154,14 +169,20 @@ class SteamAccount:
                     
         except Exception as e:
             logging.error(f"[{self.name}] Ошибка входа: {e}")
+            if "TwoFactorCodeMismatch" in str(e):
+                return {
+                    "success": False, 
+                    "requires_2fa": True,
+                    "message": "Неверный код Steam Guard"
+                }
             return {"success": False, "message": str(e)}
         finally:
             self.login_future = None
             
-    async def start_boosting(self) -> Dict[str, Any]:
+    async def start_boosting(self, two_factor_code: Optional[str] = None) -> Dict[str, Any]:
         """Запуск накрутки часов"""
         # Сначала проверяем/обновляем логин
-        login_result = await self.login()
+        login_result = await self.login(two_factor_code)
         
         if not login_result["success"]:
             if login_result.get("requires_2fa"):
@@ -227,10 +248,11 @@ class SteamManager:
             future = self.pending_2fa.pop(account_name)
             if not future.done():
                 future.set_result(two_factor_code)
-            return {"success": True, "message": "Код отправлен"}
+            # Продолжаем запуск с полученным кодом
+            return await account.start_boosting(two_factor_code)
         
         # Запускаем накрутку
-        result = await account.start_boosting()
+        result = await account.start_boosting(two_factor_code)
         
         # Если требуется 2FA, создаем future для ожидания кода
         if not result["success"] and result.get("requires_2fa"):
